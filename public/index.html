@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MySocia AI Agent</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 700px; margin: 40px auto; background: #0d1117; color: #c9d1d9; padding: 20px; }
+        h1 { color: #58a6ff; }
+        .panel { background: #161b22; padding: 20px; border-radius: 8px; border: 1px solid #30363d; margin-bottom: 20px; }
+        button { padding: 15px 30px; font-size: 16px; font-weight: bold; border-radius: 8px; border: none; background: #238636; color: white; cursor: pointer; }
+        button:hover { background: #2ea043; }
+        button:disabled { background: #21262d; color: #8b949e; cursor: not-allowed; }
+        #logs { height: 350px; overflow-y: auto; font-family: monospace; white-space: pre-wrap; margin-top: 15px; }
+        .user { color: #79c0ff; margin-bottom: 8px; }
+        .agent { color: #7ee787; margin-bottom: 8px; }
+        .system { color: #8b949e; margin-bottom: 8px; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>MySocia Voice Assistant</h1>
+    
+    <div class="panel">
+        <h3 style="margin-top: 0;">WhatsApp Status: <span id="wa-status" style="color: #e3b341;">Initializing...</span></h3>
+        <img id="wa-qr" style="display: none; width: 250px; height: 250px; border-radius: 8px;" alt="WhatsApp QR Code" />
+    </div>
+
+    <div class="panel">
+        <button id="startBtn">Connect Microphone</button>
+        <div id="logs"><div class="system">Waiting for microphone...</div></div>
+    </div>
+
+ <script>
+        let ws;
+        let audioContext;
+        let nextPlayTime = 0;
+
+        // 1. Connect to Backend IMMEDIATELY on page load
+        ws = new WebSocket('ws://' + window.location.host);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+            log('✅ Connected to Node Backend.', 'system');
+        };
+
+        // 2. Listen for WhatsApp and AssemblyAI events immediately
+        ws.onmessage = (event) => {
+            if (typeof event.data === 'string') {
+                const msg = JSON.parse(event.data);
+                
+                if (msg.type === 'whatsapp.status') {
+                    const statusText = document.getElementById('wa-status');
+                    const qrImg = document.getElementById('wa-qr');
+                    if (msg.data.status === 'qr') {
+                        statusText.innerText = 'Scan QR Code';
+                        statusText.style.color = '#e3b341';
+                        qrImg.src = msg.data.qrImage;
+                        qrImg.style.display = 'block';
+                    } else if (msg.data.status === 'connected') {
+                        statusText.innerText = 'Connected';
+                        statusText.style.color = '#3fb950';
+                        qrImg.style.display = 'none';
+                    } else if (msg.data.status === 'disconnected') {
+                        statusText.innerText = 'Disconnected';
+                        statusText.style.color = '#f85149';
+                    }
+                }
+                    else if (msg.type === 'transcript.user') log(`👤 You: "${msg.text}"`, 'user');
+                    else if (msg.type === 'transcript.agent') log(`🤖 Agent: "${msg.text}"`, 'agent');
+                    else if (msg.type === 'reply.audio' && msg.audio) playAudio(msg.audio);
+            }
+        };
+
+        // 3. Handle Mic strictly on button click
+        document.getElementById('startBtn').addEventListener('click', async () => {
+            const btn = document.getElementById('startBtn');
+            btn.disabled = true;
+            btn.innerText = "Requesting Mic...";
+
+            try {
+                // Relaxed constraints: let the browser pick any working mic
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                
+                // AudioContext handles the 24kHz downsampling natively
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                nextPlayTime = audioContext.currentTime;
+
+                const source = audioContext.createMediaStreamSource(stream);
+                const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                btn.innerText = "🎤 Listening...";
+                log('🎤 Microphone active. Speak now!', 'system');
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                processor.onaudioprocess = (e) => {
+                    if (ws.readyState !== WebSocket.OPEN) return;
+                    const float32Array = e.inputBuffer.getChannelData(0);
+                    const int16Array = new Int16Array(float32Array.length);
+                    for (let i = 0; i < float32Array.length; i++) {
+                        int16Array[i] = Math.max(-32768, Math.min(32767, float32Array[i] * 32768));
+                    }
+                    ws.send(int16Array.buffer);
+                };
+
+            } catch (err) {
+                log(`❌ Mic access failed: ${err.message}`, 'system');
+                btn.disabled = false;
+                btn.innerText = "Connect Microphone";
+            }
+        });
+
+        function playAudio(base64Str) {
+            if (!audioContext) return;
+            const binaryStr = window.atob(base64Str);
+            const bytes = new Uint8Array(binaryStr.length);
+            for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+
+            const int16 = new Int16Array(bytes.buffer);
+            const float32 = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+            const audioBuffer = audioContext.createBuffer(1, float32.length, 16000);
+            audioBuffer.getChannelData(0).set(float32);
+            
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+
+            if (nextPlayTime < audioContext.currentTime) nextPlayTime = audioContext.currentTime;
+            source.start(nextPlayTime);
+            nextPlayTime += audioBuffer.duration;
+        }
+
+        function log(text, className = '') {
+            const logs = document.getElementById('logs');
+            logs.innerHTML += `<div class="${className}">${text}</div>`;
+            logs.scrollTop = logs.scrollHeight;
+        }
+    </script>
+</body>
+</html>
