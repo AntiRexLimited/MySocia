@@ -30,112 +30,215 @@
         <div id="logs"><div class="system">Waiting for microphone...</div></div>
     </div>
 
- <script>
-        let ws;
+    <script>
         let audioContext;
         let nextPlayTime = 0;
+        const playbackJitterBufferSeconds = 0.15;
+        const activeAudioSources = new Set();
+        const transcriptEntries = new Map();
+        let agentReady = false;
+        let agentError = null;
+        const readinessWaiters = new Set();
 
-        // 1. Connect to Backend IMMEDIATELY on page load
-        ws = new WebSocket('ws://' + window.location.host);
-        ws.binaryType = 'arraybuffer';
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${wsProtocol}//${window.location.host}`);
 
-        ws.onopen = () => {
-            log('✅ Connected to Node Backend.', 'system');
+        ws.onopen = () => log('Connected to Node backend.', 'system');
+        ws.onerror = () => log('Backend WebSocket connection failed.', 'system');
+        ws.onclose = () => {
+            agentReady = false;
+            rejectReadinessWaiters(new Error('Backend connection closed.'));
+            log('Backend connection closed.', 'system');
         };
 
-        // 2. Listen for WhatsApp and AssemblyAI events immediately
         ws.onmessage = (event) => {
-            if (typeof event.data === 'string') {
-                const msg = JSON.parse(event.data);
-                
-                if (msg.type === 'whatsapp.status') {
-                    const statusText = document.getElementById('wa-status');
-                    const qrImg = document.getElementById('wa-qr');
-                    if (msg.data.status === 'qr') {
-                        statusText.innerText = 'Scan QR Code';
-                        statusText.style.color = '#e3b341';
-                        qrImg.src = msg.data.qrImage;
-                        qrImg.style.display = 'block';
-                    } else if (msg.data.status === 'connected') {
-                        statusText.innerText = 'Connected';
-                        statusText.style.color = '#3fb950';
-                        qrImg.style.display = 'none';
-                    } else if (msg.data.status === 'disconnected') {
-                        statusText.innerText = 'Disconnected';
-                        statusText.style.color = '#f85149';
-                    }
+            if (typeof event.data !== 'string') return;
+            const msg = JSON.parse(event.data);
+
+            if (msg.type === 'whatsapp.status') {
+                const statusText = document.getElementById('wa-status');
+                const qrImg = document.getElementById('wa-qr');
+                if (msg.data.status === 'qr') {
+                    statusText.textContent = 'Scan QR Code';
+                    statusText.style.color = '#e3b341';
+                    qrImg.src = msg.data.qrImage;
+                    qrImg.style.display = 'block';
+                } else if (msg.data.status === 'connected') {
+                    statusText.textContent = 'Connected';
+                    statusText.style.color = '#3fb950';
+                    qrImg.style.display = 'none';
+                } else if (msg.data.status === 'disconnected') {
+                    statusText.textContent = 'Disconnected';
+                    statusText.style.color = '#f85149';
                 }
-                    else if (msg.type === 'transcript.user') log(`👤 You: "${msg.text}"`, 'user');
-                    else if (msg.type === 'transcript.agent') log(`🤖 Agent: "${msg.text}"`, 'agent');
-                    else if (msg.type === 'reply.audio' && msg.audio) playAudio(msg.audio);
+            } else if (msg.type === 'session.ready') {
+                agentReady = true;
+                agentError = null;
+                resolveReadinessWaiters();
+                log('Voice agent ready.', 'system');
+            } else if (msg.type === 'session.error') {
+                agentReady = false;
+                agentError = msg.message || 'Voice agent session failed.';
+                rejectReadinessWaiters(new Error(agentError));
+                log(`Voice agent error: ${agentError}`, 'system');
+            } else if (msg.type === 'session.ended') {
+                agentReady = false;
+                log('Voice agent session ended.', 'system');
+            } else if (msg.type === 'transcript.user.delta') {
+                updateTranscript(`user:${msg.item_id}`, `You: "${msg.text}`, 'user');
+            } else if (msg.type === 'transcript.user') {
+                updateTranscript(`user:${msg.item_id}`, `You: "${msg.text}"`, 'user');
+            } else if (msg.type === 'transcript.agent.delta') {
+                const entryKey = `agent:${msg.reply_id}`;
+                const currentText = transcriptEntries.get(entryKey)?.textContent || 'Agent: "';
+                updateTranscript(entryKey, `${appendTranscriptDelta(currentText, msg.delta)}`, 'agent');
+            } else if (msg.type === 'transcript.agent') {
+                updateTranscript(`agent:${msg.reply_id}`, `Agent: "${msg.text}"`, 'agent');
+            } else if (msg.type === 'reply.audio' && msg.data) {
+                playAudio(msg.data);
+            } else if (msg.type === 'reply.done' && msg.status === 'interrupted') {
+                stopPlayback();
             }
         };
 
-        // 3. Handle Mic strictly on button click
         document.getElementById('startBtn').addEventListener('click', async () => {
             const btn = document.getElementById('startBtn');
+            let micStream;
             btn.disabled = true;
-            btn.innerText = "Requesting Mic...";
+            btn.textContent = 'Requesting microphone...';
 
             try {
-                // Relaxed constraints: let the browser pick any working mic
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                
-                // AudioContext handles the 24kHz downsampling natively
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                nextPlayTime = audioContext.currentTime;
+                micStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                        channelCount: 1
+                    }
+                });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                await audioContext.resume();
+                await audioContext.audioWorklet.addModule('pcm-processor.js');
+                await waitForAgentReady();
 
-                const source = audioContext.createMediaStreamSource(stream);
-                const processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-                btn.innerText = "🎤 Listening...";
-                log('🎤 Microphone active. Speak now!', 'system');
-                
+                const source = audioContext.createMediaStreamSource(micStream);
+                const processor = new AudioWorkletNode(audioContext, 'pcm16-resampler', {
+                    processorOptions: { targetSampleRate: 24000 }
+                });
+                processor.port.onmessage = ({ data }) => {
+                    if (agentReady && ws.readyState === WebSocket.OPEN) ws.send(data);
+                };
                 source.connect(processor);
                 processor.connect(audioContext.destination);
 
-                processor.onaudioprocess = (e) => {
-                    if (ws.readyState !== WebSocket.OPEN) return;
-                    const float32Array = e.inputBuffer.getChannelData(0);
-                    const int16Array = new Int16Array(float32Array.length);
-                    for (let i = 0; i < float32Array.length; i++) {
-                        int16Array[i] = Math.max(-32768, Math.min(32767, float32Array[i] * 32768));
-                    }
-                    ws.send(int16Array.buffer);
-                };
-
+                nextPlayTime = audioContext.currentTime;
+                btn.textContent = 'Listening...';
+                log(`Microphone active (${audioContext.sampleRate} Hz input; resampled to 24 kHz).`, 'system');
             } catch (err) {
-                log(`❌ Mic access failed: ${err.message}`, 'system');
+                micStream?.getTracks().forEach((track) => track.stop());
+                if (audioContext && audioContext.state !== 'closed') await audioContext.close();
+                audioContext = null;
+                log(`Microphone setup failed: ${err.message}`, 'system');
                 btn.disabled = false;
-                btn.innerText = "Connect Microphone";
+                btn.textContent = 'Connect Microphone';
             }
         });
 
-        function playAudio(base64Str) {
+        function waitForAgentReady() {
+            if (agentReady) return Promise.resolve();
+            if (agentError) return Promise.reject(new Error(agentError));
+
+            return new Promise((resolve, reject) => {
+                let timeout;
+                const waiter = {
+                    resolve: () => {
+                        clearTimeout(timeout);
+                        readinessWaiters.delete(waiter);
+                        resolve();
+                    },
+                    reject: (error) => {
+                        clearTimeout(timeout);
+                        readinessWaiters.delete(waiter);
+                        reject(error);
+                    }
+                };
+                timeout = setTimeout(() => waiter.reject(new Error('Timed out waiting for the voice agent.')), 15000);
+                readinessWaiters.add(waiter);
+            });
+        }
+
+        function resolveReadinessWaiters() {
+            readinessWaiters.forEach((waiter) => waiter.resolve());
+        }
+
+        function rejectReadinessWaiters(error) {
+            readinessWaiters.forEach((waiter) => waiter.reject(error));
+        }
+
+        function playAudio(base64Audio) {
             if (!audioContext) return;
-            const binaryStr = window.atob(base64Str);
-            const bytes = new Uint8Array(binaryStr.length);
-            for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+            const binary = window.atob(base64Audio);
+            const view = new DataView(Uint8Array.from(binary, (char) => char.charCodeAt(0)).buffer);
+            const sampleCount = Math.floor(view.byteLength / 2);
+            const samples = new Float32Array(sampleCount);
+            for (let i = 0; i < sampleCount; i++) samples[i] = view.getInt16(i * 2, true) / 32768;
 
-            const int16 = new Int16Array(bytes.buffer);
-            const float32 = new Float32Array(int16.length);
-            for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
-
-            const audioBuffer = audioContext.createBuffer(1, float32.length, 16000);
-            audioBuffer.getChannelData(0).set(float32);
-            
+            const audioBuffer = audioContext.createBuffer(1, sampleCount, 24000);
+            audioBuffer.getChannelData(0).set(samples);
             const source = audioContext.createBufferSource();
             source.buffer = audioBuffer;
             source.connect(audioContext.destination);
+            activeAudioSources.add(source);
+            source.onended = () => {
+                activeAudioSources.delete(source);
+                source.disconnect();
+            };
 
-            if (nextPlayTime < audioContext.currentTime) nextPlayTime = audioContext.currentTime;
+            nextPlayTime = Math.max(
+                nextPlayTime,
+                audioContext.currentTime + playbackJitterBufferSeconds
+            );
             source.start(nextPlayTime);
             nextPlayTime += audioBuffer.duration;
         }
 
-        function log(text, className = '') {
+        function stopPlayback() {
+            for (const source of activeAudioSources) {
+                source.stop();
+                source.disconnect();
+            }
+            activeAudioSources.clear();
+            if (audioContext) nextPlayTime = audioContext.currentTime + playbackJitterBufferSeconds;
+        }
+
+        function updateTranscript(key, text, className) {
+            let entry = transcriptEntries.get(key);
+            if (!entry) {
+                entry = document.createElement('div');
+                entry.className = className;
+                transcriptEntries.set(key, entry);
+                document.getElementById('logs').appendChild(entry);
+            }
+            entry.textContent = text;
             const logs = document.getElementById('logs');
-            logs.innerHTML += `<div class="${className}">${text}</div>`;
+            logs.scrollTop = logs.scrollHeight;
+        }
+
+        function appendTranscriptDelta(current, delta) {
+            if (!current || !delta) return current + delta;
+            if (current === 'Agent: "') return current + delta;
+            if (/^\s/.test(delta) || /\s$/.test(current) || /^[,.;:!?%…)}\]]/.test(delta)) {
+                return current + delta;
+            }
+            return `${current} ${delta}`;
+        }
+
+        function log(text, className = '') {
+            const entry = document.createElement('div');
+            entry.className = className;
+            entry.textContent = text;
+            const logs = document.getElementById('logs');
+            logs.appendChild(entry);
             logs.scrollTop = logs.scrollHeight;
         }
     </script>

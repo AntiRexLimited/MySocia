@@ -10,6 +10,7 @@ whatsapp/auth_info/
 
 # WhatsApp Contact Data (Prevents leaking your personal contacts)
 whatsapp/contacts.json
+whatsapp/conversation-history.json
 
 # Logs
 npm-debug.log*

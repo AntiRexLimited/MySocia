@@ -33,6 +33,7 @@ const tools = [
 ];
 
 function initializeVoiceAgent(clientWs) {
+  let sessionReady = false;
   const aaiWs = new WebSocket('wss://agents.assemblyai.com/v1/ws', {
     headers: { Authorization: `Bearer ${ASSEMBLYAI_API_KEY}` }
   });
@@ -48,7 +49,7 @@ function initializeVoiceAgent(clientWs) {
   });
 
   clientWs.on('message', (message, isBinary) => {
-    if (isBinary && aaiWs.readyState === WebSocket.OPEN) {
+    if (isBinary && sessionReady && aaiWs.readyState === WebSocket.OPEN) {
       aaiWs.send(JSON.stringify({
         type: 'input.audio',
         audio: message.toString('base64')
@@ -58,13 +59,19 @@ function initializeVoiceAgent(clientWs) {
 
   aaiWs.on('message', async (raw) => {
     const event = JSON.parse(raw.toString());
+
+    if (event.type === 'session.ready' || event.type === 'session.updated') sessionReady = true;
+    if (event.type === 'session.ended') sessionReady = false;
     
     if (event.type !== 'reply.audio') {
       console.log(`📡 AssemblyAI Event: ${event.type}`);
       if (event.type === 'session.error') console.error(event);
     }
 
-if (event.type === 'reply.audio' || event.type === 'transcript.user' || event.type === 'transcript.agent') {      if (clientWs.readyState === WebSocket.OPEN) {
+    if (
+      ['session.ready', 'session.updated', 'session.error', 'session.ended', 'reply.audio', 'reply.done', 'transcript.user.delta', 'transcript.user', 'transcript.agent.delta', 'transcript.agent'].includes(event.type)
+    ) {
+      if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(JSON.stringify(event));
       }
     } 
